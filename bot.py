@@ -5,64 +5,94 @@ import time
 import urllib.request
 import urllib.error
 
-# =========================
-# Configuration
-# =========================
+# =====================================
+# CONFIGURATION
+# =====================================
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID_RAW = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
+MODEL = "gemini-3.8-flash"
+
+TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+
+# =====================================
+# CHECK SETTINGS
+# =====================================
+
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN is missing")
 
 if not CHAT_ID_RAW:
-    raise ValueError("TELEGRAM_CHAT_ID is empty")
+    raise ValueError("TELEGRAM_CHAT_ID is missing")
 
 if not CHAT_ID_RAW.lstrip("-").isdigit():
-    raise ValueError("TELEGRAM_CHAT_ID must be a number")
+    raise ValueError("TELEGRAM_CHAT_ID must be numeric")
 
 if not GEMINI_KEY:
     raise ValueError("GEMINI_API_KEY is missing")
 
 CHAT_ID = int(CHAT_ID_RAW)
 
-TELEGRAM = f"https://api.telegram.org/bot{TOKEN}"
-GEMINI = "https://generativelanguage.googleapis.com/v1beta/interactions"
-MODEL = "gemini-3.8-flash"
+# =====================================
+# CONVERSATION MEMORY
+# =====================================
 
-# Conversation state
 previous_interaction_id = None
 offset = 0
 
-
-# =========================
-# Telegram API
-# =========================
+# =====================================
+# TELEGRAM REQUEST
+# =====================================
 
 def telegram(method, data=None):
+
     payload = json.dumps(data or {}).encode("utf-8")
 
-    req = urllib.request.Request(
-        f"{TELEGRAM}/{method}",
+    request = urllib.request.Request(
+        f"{TELEGRAM_URL}/{method}",
         data=payload,
-        headers={"Content-Type": "application/json"}
+        headers={
+            "Content-Type": "application/json"
+        },
+        method="POST"
     )
 
-    with urllib.request.urlopen(req, timeout=40) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(
+            request, timeout=45
+        ) as response:
+
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except urllib.error.HTTPError as error:
+
+        details = error.read().decode(
+            "utf-8", errors="replace"
+        )
+
+        raise RuntimeError(
+            f"Telegram HTTP {error.code}: {details[:1000]}"
+        )
 
     if not result.get("ok"):
-        raise RuntimeError("Telegram API returned an error")
+        raise RuntimeError(
+            f"Telegram error: {result}"
+        )
 
     return result
 
 
-# =========================
-# Gemini API
-# =========================
+# =====================================
+# GEMINI REQUEST
+# =====================================
 
 def ask_gemini(message):
+
     global previous_interaction_id
 
     body = {
@@ -71,10 +101,12 @@ def ask_gemini(message):
     }
 
     if previous_interaction_id:
-        body["previous_interaction_id"] = previous_interaction_id
+        body["previous_interaction_id"] = (
+            previous_interaction_id
+        )
 
-    req = urllib.request.Request(
-        GEMINI,
+    request = urllib.request.Request(
+        GEMINI_URL,
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -84,97 +116,132 @@ def ask_gemini(message):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            result = json.loads(response.read().decode("utf-8"))
 
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(
+            request, timeout=120
+        ) as response:
+
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except urllib.error.HTTPError as error:
+
+        details = error.read().decode(
+            "utf-8", errors="replace"
+        )
+
         raise RuntimeError(
-            f"Gemini HTTP {e.code}: {error_body[:1500]}"
+            f"Gemini HTTP {error.code}: {details[:2000]}"
         )
 
     if result.get("status") == "failed":
-        raise RuntimeError("Gemini interaction failed")
+
+        raise RuntimeError(
+            f"Gemini interaction failed: {result}"
+        )
 
     answer_parts = []
 
     for step in result.get("steps", []):
-        if step.get("type") == "model_output":
-            for part in step.get("content", []):
-                if part.get("type") == "text":
-                    answer_parts.append(part.get("text", ""))
 
-    answer = "\n".join(
-        part for part in answer_parts if part
-    ).strip()
+        if step.get("type") == "model_output":
+
+            for part in step.get("content", []):
+
+                if part.get("type") == "text":
+
+                    text = part.get("text", "")
+
+                    if text:
+                        answer_parts.append(text)
+
+    answer = "\n".join(answer_parts).strip()
 
     if not answer:
-        raise RuntimeError("Gemini returned no text response")
 
-    new_id = result.get("id")
+        raise RuntimeError(
+            f"Gemini returned no text: {result}"
+        )
 
-    if not new_id:
-        raise RuntimeError("Gemini did not return an interaction ID")
+    interaction_id = result.get("id")
 
-    previous_interaction_id = new_id
+    if not interaction_id:
+
+        raise RuntimeError(
+            "Gemini did not return interaction ID"
+        )
+
+    previous_interaction_id = interaction_id
 
     return answer
 
 
-# =========================
-# Send Telegram Messages
-# =========================
+# =====================================
+# SEND TELEGRAM MESSAGE
+# =====================================
 
 def send_message(chat_id, message):
+
     if not message:
         return
 
-    for i in range(0, len(message), 4000):
+    for start in range(0, len(message), 4000):
+
+        part = message[start:start + 4000]
+
         telegram("sendMessage", {
             "chat_id": chat_id,
-            "text": message[i:i + 4000]
+            "text": part
         })
 
 
-# =========================
-# Start Bot
-# =========================
+# =====================================
+# START BOT
+# =====================================
 
-print("Telegram Gemini Bot is starting...")
+print("================================")
+print("Telegram Gemini Bot is starting")
+print("================================")
 
 telegram("getMe")
-print("Telegram connection successful")
 
+print("Telegram connection successful")
 print("Gemini model:", MODEL)
 print("Bot is ready")
 
-
-# =========================
-# Main Loop
-# =========================
+# =====================================
+# MAIN LOOP
+# =====================================
 
 while True:
+
     try:
-        result = telegram("getUpdates", {
+
+        updates = telegram("getUpdates", {
             "offset": offset,
             "timeout": 30,
             "allowed_updates": ["message"]
         })
 
-        for update in result.get("result", []):
+        for update in updates.get("result", []):
 
             offset = update["update_id"] + 1
 
             msg = update.get("message", {})
+
             chat = msg.get("chat", {})
             sender = msg.get("from", {})
 
-            # Only authorized private account
-            if (
-                chat.get("type") != "private"
-                or chat.get("id") != CHAT_ID
-                or sender.get("id") != CHAT_ID
-            ):
+            # Only your authorized private account
+
+            if chat.get("type") != "private":
+                continue
+
+            if chat.get("id") != CHAT_ID:
+                continue
+
+            if sender.get("id") != CHAT_ID:
                 continue
 
             message = msg.get("text", "").strip()
@@ -182,33 +249,77 @@ while True:
             if not message:
                 continue
 
+            # START COMMAND
+
             if message == "/start":
+
                 send_message(
                     CHAT_ID,
-                    "أهلاً بك! أنا مساعدك الشخصي المدعوم بـ Gemini 3.8 Flash 🤖"
+                    "أهلاً بك! 🤖\n\n"
+                    "أنا مساعدك الشخصي المدعوم "
+                    "بواسطة Google Gemini.\n\n"
+                    "ابعت لي أي سؤال وسأرد عليك."
                 )
+
                 continue
 
+            # CLEAR CONVERSATION
+
             if message == "/clear":
+
                 previous_interaction_id = None
 
                 send_message(
                     CHAT_ID,
-                    "تم مسح سياق المحادثة. نبدأ من جديد! 🧹"
+                    "تم مسح ذاكرة المحادثة. 🧹\n"
+                    "نبدأ من جديد!"
                 )
+
                 continue
 
-            try:
-                send_message(CHAT_ID, ask_gemini(message))
+            # ASK GEMINI
 
-            except Exception as e:
-                print("Gemini error:", str(e))
+            try:
+
+                print("New message received")
 
                 send_message(
                     CHAT_ID,
-                    "حصل خطأ أثناء الاتصال بـ Gemini. حاول مرة أخرى."
+                    "جاري التفكير... 🤖"
                 )
 
-    except Exception as e:
-        print("Connection error:", str(e))
+                answer = ask_gemini(message)
+
+                send_message(CHAT_ID, answer)
+
+                print("Gemini response sent successfully")
+
+            except Exception as error:
+
+                print("Gemini error:", str(error))
+
+                send_message(
+                    CHAT_ID,
+                    "حدث خطأ أثناء الاتصال بـ Gemini.\n\n"
+                    "يرجى مراجعة إعدادات API Key "
+                    "وسجل الأخطاء في GitHub."
+                )
+
+    except Exception as error:
+
+        error_text = str(error)
+
+        print("Connection error:", error_text)
+
+        # Stop if another bot instance is polling Telegram
+
+        if "409" in error_text or "Conflict" in error_text:
+
+            print(
+                "Another bot instance is using this token. "
+                "Stop the other workflow before restarting."
+            )
+
+            raise SystemExit(1)
+
         time.sleep(5)
