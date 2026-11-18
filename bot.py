@@ -6,10 +6,9 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-TOKEN = os.environ["8960652955:AAFb7D190phzxM2JgPTl-F2ZpEMH2SoKoqQ04:04 PM"]
-CHAT_ID = int(os.environ["6184119318"])
-GEMINI_KEY = os.environ["AQ.Ab8RN6KRbrV325-OZgoRtJANvy1JPAEI5yRdPecZrcbi_DaSRg
-"]
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
+GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 
 TELEGRAM = f"https://api.telegram.org/bot{TOKEN}"
 GEMINI = (
