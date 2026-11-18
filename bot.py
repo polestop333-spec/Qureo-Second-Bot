@@ -3,86 +3,155 @@ import os
 import json
 import time
 import urllib.request
-import urllib.parse
 import urllib.error
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+# =========================
+# Configuration
+# =========================
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID_RAW = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+
+if not TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN is missing")
+
+if not CHAT_ID_RAW:
+    raise ValueError("TELEGRAM_CHAT_ID is empty")
+
+if not CHAT_ID_RAW.lstrip("-").isdigit():
+    raise ValueError("TELEGRAM_CHAT_ID must be a number")
+
+if not GEMINI_KEY:
+    raise ValueError("GEMINI_API_KEY is missing")
+
+CHAT_ID = int(CHAT_ID_RAW)
 
 TELEGRAM = f"https://api.telegram.org/bot{TOKEN}"
-GEMINI = (
-    "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-3.8-flash:generateContent"
-)
+GEMINI = "https://generativelanguage.googleapis.com/v1beta/interactions"
+MODEL = "gemini-3.8-flash"
 
-history = []
+# Conversation state
+previous_interaction_id = None
 offset = 0
 
 
+# =========================
+# Telegram API
+# =========================
+
 def telegram(method, data=None):
-    payload = json.dumps(data or {}).encode()
+    payload = json.dumps(data or {}).encode("utf-8")
+
     req = urllib.request.Request(
         f"{TELEGRAM}/{method}",
         data=payload,
         headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=40) as response:
-        return json.loads(response.read())
 
+    with urllib.request.urlopen(req, timeout=40) as response:
+        result = json.loads(response.read().decode("utf-8"))
+
+    if not result.get("ok"):
+        raise RuntimeError("Telegram API returned an error")
+
+    return result
+
+
+# =========================
+# Gemini API
+# =========================
 
 def ask_gemini(message):
-    global history
-
-    history.append({
-        "role": "user",
-        "parts": [{"text": message}]
-    })
-
-    history = history[-20:]
+    global previous_interaction_id
 
     body = {
-        "contents": history,
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 2048
-        }
+        "model": MODEL,
+        "input": message
     }
+
+    if previous_interaction_id:
+        body["previous_interaction_id"] = previous_interaction_id
 
     req = urllib.request.Request(
         GEMINI,
-        data=json.dumps(body).encode(),
+        data=json.dumps(body).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "x-goog-api-key": GEMINI_KEY
-        }
+        },
+        method="POST"
     )
 
-    with urllib.request.urlopen(req, timeout=120) as response:
-        result = json.loads(response.read())
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-    answer = "".join(
-        part.get("text", "")
-        for part in result["candidates"][0]["content"]["parts"]
-    )
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Gemini HTTP {e.code}: {error_body[:1500]}"
+        )
 
-    history.append({
-        "role": "model",
-        "parts": [{"text": answer}]
-    })
+    if result.get("status") == "failed":
+        raise RuntimeError("Gemini interaction failed")
+
+    answer_parts = []
+
+    for step in result.get("steps", []):
+        if step.get("type") == "model_output":
+            for part in step.get("content", []):
+                if part.get("type") == "text":
+                    answer_parts.append(part.get("text", ""))
+
+    answer = "\n".join(
+        part for part in answer_parts if part
+    ).strip()
+
+    if not answer:
+        raise RuntimeError("Gemini returned no text response")
+
+    new_id = result.get("id")
+
+    if not new_id:
+        raise RuntimeError("Gemini did not return an interaction ID")
+
+    previous_interaction_id = new_id
 
     return answer
 
 
-def send_message(chat_id, text):
-    for i in range(0, len(text), 4000):
+# =========================
+# Send Telegram Messages
+# =========================
+
+def send_message(chat_id, message):
+    if not message:
+        return
+
+    for i in range(0, len(message), 4000):
         telegram("sendMessage", {
             "chat_id": chat_id,
-            "text": text[i:i+4000]
+            "text": message[i:i + 4000]
         })
 
 
-print("BOT STARTED SUCCESSFULLY")
+# =========================
+# Start Bot
+# =========================
+
+print("Telegram Gemini Bot is starting...")
+
+telegram("getMe")
+print("Telegram connection successful")
+
+print("Gemini model:", MODEL)
+print("Bot is ready")
+
+
+# =========================
+# Main Loop
+# =========================
 
 while True:
     try:
@@ -93,13 +162,14 @@ while True:
         })
 
         for update in result.get("result", []):
+
             offset = update["update_id"] + 1
 
             msg = update.get("message", {})
             chat = msg.get("chat", {})
             sender = msg.get("from", {})
 
-            # Only your private account
+            # Only authorized private account
             if (
                 chat.get("type") != "private"
                 or chat.get("id") != CHAT_ID
@@ -115,21 +185,25 @@ while True:
             if message == "/start":
                 send_message(
                     CHAT_ID,
-                    "أهلاً بك! أنا مساعدك الشخصي المدعوم بـ Gemini 🤖"
+                    "أهلاً بك! أنا مساعدك الشخصي المدعوم بـ Gemini 3.8 Flash 🤖"
                 )
                 continue
 
             if message == "/clear":
-                history.clear()
-                send_message(CHAT_ID, "تم مسح سياق المحادثة.")
+                previous_interaction_id = None
+
+                send_message(
+                    CHAT_ID,
+                    "تم مسح سياق المحادثة. نبدأ من جديد! 🧹"
+                )
                 continue
 
             try:
-                answer = ask_gemini(message)
-                send_message(CHAT_ID, answer)
+                send_message(CHAT_ID, ask_gemini(message))
 
             except Exception as e:
                 print("Gemini error:", str(e))
+
                 send_message(
                     CHAT_ID,
                     "حصل خطأ أثناء الاتصال بـ Gemini. حاول مرة أخرى."
