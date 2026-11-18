@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 
 # =====================================
-# CONFIGURATION
+# SETTINGS
 # =====================================
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -16,35 +16,35 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 MODEL = "gemini-3.8-flash"
 
 TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
-# =====================================
-# CHECK SETTINGS
-# =====================================
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/"
+    f"v1beta/models/{MODEL}:generateContent"
+)
 
 if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN is missing")
+    raise ValueError("Missing TELEGRAM_BOT_TOKEN")
 
 if not CHAT_ID_RAW:
-    raise ValueError("TELEGRAM_CHAT_ID is missing")
+    raise ValueError("Missing TELEGRAM_CHAT_ID")
 
 if not CHAT_ID_RAW.lstrip("-").isdigit():
-    raise ValueError("TELEGRAM_CHAT_ID must be numeric")
+    raise ValueError("Invalid TELEGRAM_CHAT_ID")
 
 if not GEMINI_KEY:
-    raise ValueError("GEMINI_API_KEY is missing")
+    raise ValueError("Missing GEMINI_API_KEY")
 
 CHAT_ID = int(CHAT_ID_RAW)
 
 # =====================================
-# CONVERSATION MEMORY
+# MEMORY
 # =====================================
 
-previous_interaction_id = None
+conversation_history = []
 offset = 0
 
 # =====================================
-# TELEGRAM REQUEST
+# TELEGRAM API
 # =====================================
 
 def telegram(method, data=None):
@@ -76,34 +76,39 @@ def telegram(method, data=None):
         )
 
         raise RuntimeError(
-            f"Telegram HTTP {error.code}: {details[:1000]}"
+            f"Telegram HTTP {error.code}: {details}"
         )
 
     if not result.get("ok"):
-        raise RuntimeError(
-            f"Telegram error: {result}"
-        )
+        raise RuntimeError(str(result))
 
     return result
 
 
 # =====================================
-# GEMINI REQUEST
+# GEMINI API
 # =====================================
 
 def ask_gemini(message):
 
-    global previous_interaction_id
+    global conversation_history
+
+    new_history = conversation_history + [
+        {
+            "role": "user",
+            "parts": [
+                {"text": message}
+            ]
+        }
+    ]
 
     body = {
-        "model": MODEL,
-        "input": message
+        "contents": new_history,
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 4096
+        }
     }
-
-    if previous_interaction_id:
-        body["previous_interaction_id"] = (
-            previous_interaction_id
-        )
 
     request = urllib.request.Request(
         GEMINI_URL,
@@ -131,78 +136,80 @@ def ask_gemini(message):
             "utf-8", errors="replace"
         )
 
+        try:
+            error_data = json.loads(details)
+            details = error_data.get(
+                "error", {}
+            ).get("message", details)
+        except Exception:
+            pass
+
         raise RuntimeError(
-            f"Gemini HTTP {error.code}: {details[:2000]}"
+            f"Gemini HTTP {error.code}: {details}"
         )
 
-    if result.get("status") == "failed":
+    candidates = result.get("candidates", [])
 
+    if not candidates:
         raise RuntimeError(
-            f"Gemini interaction failed: {result}"
+            "Gemini returned no candidates: "
+            + json.dumps(result, ensure_ascii=False)[:1500]
         )
 
-    answer_parts = []
+    parts = candidates[0].get(
+        "content", {}
+    ).get("parts", [])
 
-    for step in result.get("steps", []):
-
-        if step.get("type") == "model_output":
-
-            for part in step.get("content", []):
-
-                if part.get("type") == "text":
-
-                    text = part.get("text", "")
-
-                    if text:
-                        answer_parts.append(text)
-
-    answer = "\n".join(answer_parts).strip()
+    answer = "\n".join(
+        part.get("text", "")
+        for part in parts
+        if part.get("text")
+        and not part.get("thought", False)
+    ).strip()
 
     if not answer:
-
         raise RuntimeError(
-            f"Gemini returned no text: {result}"
+            "Gemini returned an empty response"
         )
 
-    interaction_id = result.get("id")
+    # Save conversation only after successful response
 
-    if not interaction_id:
+    conversation_history = new_history + [
+        {
+            "role": "model",
+            "parts": [
+                {"text": answer}
+            ]
+        }
+    ]
 
-        raise RuntimeError(
-            "Gemini did not return interaction ID"
-        )
+    # Keep memory within reasonable limits
 
-    previous_interaction_id = interaction_id
+    if len(conversation_history) > 30:
+        conversation_history = conversation_history[-30:]
 
     return answer
 
 
 # =====================================
-# SEND TELEGRAM MESSAGE
+# SEND MESSAGE
 # =====================================
 
 def send_message(chat_id, message):
 
-    if not message:
-        return
-
     for start in range(0, len(message), 4000):
-
-        part = message[start:start + 4000]
 
         telegram("sendMessage", {
             "chat_id": chat_id,
-            "text": part
+            "text": message[start:start + 4000]
         })
 
 
 # =====================================
-# START BOT
+# START
 # =====================================
 
-print("================================")
-print("Telegram Gemini Bot is starting")
-print("================================")
+print("Starting Telegram Gemini Bot...")
 
 telegram("getMe")
 
@@ -229,11 +236,8 @@ while True:
             offset = update["update_id"] + 1
 
             msg = update.get("message", {})
-
             chat = msg.get("chat", {})
             sender = msg.get("from", {})
-
-            # Only your authorized private account
 
             if chat.get("type") != "private":
                 continue
@@ -249,35 +253,28 @@ while True:
             if not message:
                 continue
 
-            # START COMMAND
-
             if message == "/start":
 
                 send_message(
                     CHAT_ID,
                     "أهلاً بك! 🤖\n\n"
-                    "أنا مساعدك الشخصي المدعوم "
-                    "بواسطة Google Gemini.\n\n"
-                    "ابعت لي أي سؤال وسأرد عليك."
+                    "أنا مساعدك الشخصي بواسطة "
+                    "Google Gemini.\n\n"
+                    "اسألني أي سؤال وسأساعدك."
                 )
 
                 continue
-
-            # CLEAR CONVERSATION
 
             if message == "/clear":
 
-                previous_interaction_id = None
+                conversation_history = []
 
                 send_message(
                     CHAT_ID,
-                    "تم مسح ذاكرة المحادثة. 🧹\n"
-                    "نبدأ من جديد!"
+                    "تم مسح ذاكرة المحادثة! 🧹"
                 )
 
                 continue
-
-            # ASK GEMINI
 
             try:
 
@@ -292,34 +289,29 @@ while True:
 
                 send_message(CHAT_ID, answer)
 
-                print("Gemini response sent successfully")
+                print("Gemini response successful")
 
             except Exception as error:
 
-                print("Gemini error:", str(error))
+                print(
+                    "GEMINI ERROR:",
+                    str(error)
+                )
 
                 send_message(
                     CHAT_ID,
-                    "حدث خطأ أثناء الاتصال بـ Gemini.\n\n"
-                    "يرجى مراجعة إعدادات API Key "
-                    "وسجل الأخطاء في GitHub."
+                    "حدث خطأ أثناء الاتصال بـ Gemini.\n"
+                    "راجع سجل GitHub لمعرفة السبب بالتحديد."
                 )
 
     except Exception as error:
 
         error_text = str(error)
 
-        print("Connection error:", error_text)
-
-        # Stop if another bot instance is polling Telegram
+        print("CONNECTION ERROR:", error_text)
 
         if "409" in error_text or "Conflict" in error_text:
-
-            print(
-                "Another bot instance is using this token. "
-                "Stop the other workflow before restarting."
-            )
-
+            print("Another bot instance is running.")
             raise SystemExit(1)
 
         time.sleep(5)
