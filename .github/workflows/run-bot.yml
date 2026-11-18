@@ -10,7 +10,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 300000050
 
     steps:
       - name: Get repository
